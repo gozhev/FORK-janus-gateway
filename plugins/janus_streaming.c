@@ -139,6 +139,7 @@ url = RTSP stream URL
 rtsp_user = RTSP authorization username, if needed
 rtsp_pwd = RTSP authorization password, if needed
 rtsp_failcheck = whether an error should be returned if connecting to the RTSP server fails (default=true)
+rtsp_on_demand = whether to disconnect from the RTSP server when there are no clients left (default=false)
 rtspiface = network interface IP address or device name to listen on when receiving RTSP streams
 rtsp_reconnect_delay = after n seconds passed and no media assumed, the RTSP server has gone and schedule a reconnect (default=5s)
 rtsp_session_timeout = by default the streaming plugin will check the RTSP connection with an OPTIONS query,
@@ -881,7 +882,8 @@ static struct janus_json_parameter rtsp_parameters[] = {
 	{"videobufferkf", JANUS_JSON_BOOL, 0},
 	{"threads", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"rtspiface", JSON_STRING, 0},
-	{"rtsp_failcheck", JANUS_JSON_BOOL, 0}
+	{"rtsp_failcheck", JANUS_JSON_BOOL, 0},
+	{"rtsp_on_demand", JANUS_JSON_BOOL, 0}
 };
 #endif
 static struct janus_json_parameter rtp_audio_parameters[] = {
@@ -1086,7 +1088,9 @@ typedef struct janus_streaming_rtp_source {
 	char *rtsp_username, *rtsp_password;
 	gint64 ka_timeout;
 	char *rtsp_ahost, *rtsp_vhost;
-	gboolean reconnecting;
+	gboolean rtsp_on_demand; /* Whether to switch to the idle mode when there are no clients left */
+	volatile gint idle;      /* Whether the relay thread should disconnect the RTSP stream and wait */
+	gboolean connected;      /* Whether we connected to the RTSP server */
 	gint64 reconnect_timer;
 	gint64 reconnect_delay;
 	gint64 session_timeout;
@@ -1211,7 +1215,7 @@ janus_streaming_mountpoint *janus_streaming_create_rtsp_source(
 		gboolean dovideo, int videopt, char *vrtpmap, char *vfmtp, gboolean bufferkf,
 		const janus_network_address *iface, int threads,
 		gint64 reconnect_delay, gint64 session_timeout, int rtsp_timeout, int rtsp_conn_timeout,
-		gboolean error_on_failure);
+		gboolean error_on_failure, gboolean rtsp_on_demand);
 
 typedef struct janus_streaming_message {
 	janus_plugin_session *handle;
@@ -2123,6 +2127,7 @@ int janus_streaming_init(janus_callbacks *callback, const char *config_path) {
 				janus_config_item *vkf = janus_config_get(config, cat, janus_config_type_item, "videobufferkf");
 				janus_config_item *iface = janus_config_get(config, cat, janus_config_type_item, "rtspiface");
 				janus_config_item *failerr = janus_config_get(config, cat, janus_config_type_item, "rtsp_failcheck");
+				janus_config_item *rtspondem = janus_config_get(config, cat, janus_config_type_item, "rtsp_on_demand");
 				janus_config_item *threads = janus_config_get(config, cat, janus_config_type_item, "threads");
 				janus_config_item *reconnect_delay = janus_config_get(config, cat, janus_config_type_item, "rtsp_reconnect_delay");
 				janus_config_item *session_timeout = janus_config_get(config, cat, janus_config_type_item, "rtsp_session_timeout");
@@ -2145,6 +2150,10 @@ int janus_streaming_init(janus_callbacks *callback, const char *config_path) {
 					JANUS_LOG(LOG_ERR, "Can't add 'rtsp' mountpoint '%s', invalid threads configuration...\n", cat->name);
 					cl = cl->next;
 					continue;
+				}
+				gboolean rtsp_on_demand = FALSE;
+				if(rtspondem && rtspondem->value) {
+					rtsp_on_demand = janus_is_true(rtspondem->value);
 				}
 
 				if((doaudio || dovideo) && iface && iface->value) {
@@ -2184,7 +2193,8 @@ int janus_streaming_init(janus_callbacks *callback, const char *config_path) {
 						((session_timeout && session_timeout->value) ? atoi(session_timeout->value) : JANUS_STREAMING_DEFAULT_SESSION_TIMEOUT) * G_USEC_PER_SEC,
 						((rtsp_timeout && rtsp_timeout->value) ? atoi(rtsp_timeout->value) : JANUS_STREAMING_DEFAULT_CURL_TIMEOUT),
 						((rtsp_conn_timeout && rtsp_conn_timeout->value) ? atoi(rtsp_conn_timeout->value) : JANUS_STREAMING_DEFAULT_CURL_CONNECT_TIMEOUT),
-						error_on_failure)) == NULL) {
+						error_on_failure,
+						rtsp_on_demand)) == NULL) {
 					JANUS_LOG(LOG_ERR, "Error creating 'rtsp' mountpoint '%s'...\n", cat->name);
 					cl = cl->next;
 					continue;
@@ -3195,6 +3205,7 @@ static json_t *janus_streaming_process_synchronous_request(janus_streaming_sessi
 			json_t *iface = json_object_get(root, "rtspiface");
 			json_t *threads = json_object_get(root, "threads");
 			json_t *failerr = json_object_get(root, "rtsp_failcheck");
+			json_t *rtspondem = json_object_get(root, "rtsp_on_demand");
 			json_t *reconnect_delay = json_object_get(root, "rtsp_reconnect_delay");
 			json_t *session_timeout = json_object_get(root, "rtsp_session_timeout");
 			json_t *rtsp_timeout = json_object_get(root, "rtsp_timeout");
@@ -3204,6 +3215,7 @@ static json_t *janus_streaming_process_synchronous_request(janus_streaming_sessi
 			gboolean doaudio = audio ? json_is_true(audio) : FALSE;
 			gboolean dovideo = video ? json_is_true(video) : FALSE;
 			gboolean error_on_failure = failerr ? json_is_true(failerr) : TRUE;
+			gboolean rtsp_on_demand = rtspondem ? json_is_true(rtspondem) : FALSE;
 			if(!doaudio && !dovideo) {
 				JANUS_LOG(LOG_ERR, "Can't add 'rtsp' stream, no audio or video have to be streamed...\n");
 				error_code = JANUS_STREAMING_ERROR_CANT_CREATE;
@@ -3246,7 +3258,8 @@ static json_t *janus_streaming_process_synchronous_request(janus_streaming_sessi
 					((session_timeout ? json_integer_value(session_timeout) : JANUS_STREAMING_DEFAULT_SESSION_TIMEOUT) * G_USEC_PER_SEC),
 					(rtsp_timeout ? json_integer_value(rtsp_timeout) : JANUS_STREAMING_DEFAULT_CURL_TIMEOUT),
 					(rtsp_conn_timeout ? json_integer_value(rtsp_conn_timeout) : JANUS_STREAMING_DEFAULT_CURL_CONNECT_TIMEOUT),
-					error_on_failure);
+					error_on_failure,
+					rtsp_on_demand);
 			janus_mutex_lock(&mountpoints_mutex);
 			g_hash_table_remove(mountpoints_temp, string_ids ? (gpointer)mpid_str : (gpointer)&mpid);
 			janus_mutex_unlock(&mountpoints_mutex);
@@ -4562,6 +4575,11 @@ static void janus_streaming_hangup_media_internal(janus_plugin_session *handle) 
 		}
 		mp->viewers = g_list_remove_all(mp->viewers, session);
 		if(mp->streaming_source == janus_streaming_source_rtp) {
+			/* Switch to the idle mode if there are no viewers anymore */
+			janus_streaming_rtp_source *source = mp->source;
+			if (source->rtsp_on_demand && mp->viewers == NULL) {
+				g_atomic_int_set(&source->idle, 1);
+			}
 			/* Remove the viewer from the helper threads too, if any */
 			if(mp->helper_threads > 0) {
 				GList *l = mp->threads;
@@ -4978,6 +4996,11 @@ done:
 			if(g_list_find(mp->viewers, session) == NULL) {
 				mp->viewers = g_list_append(mp->viewers, session);
 				if(mp->streaming_source == janus_streaming_source_rtp) {
+					/* Leave the idle mode */
+					janus_streaming_rtp_source *source = mp->source;
+					if (source->rtsp_on_demand) {
+						g_atomic_int_set(&source->idle, 0);
+					}
 					/* If we're using helper threads, add the viewer to one of those */
 					if(mp->helper_threads > 0) {
 						int viewers = -1;
@@ -7023,7 +7046,7 @@ janus_streaming_mountpoint *janus_streaming_create_rtsp_source(
 		gboolean dovideo, int vcodec, char *vrtpmap, char *vfmtp, gboolean bufferkf,
 		const janus_network_address *iface, int threads,
 		gint64 reconnect_delay, gint64 session_timeout, int rtsp_timeout, int rtsp_conn_timeout,
-		gboolean error_on_failure) {
+		gboolean error_on_failure, gboolean rtsp_on_demand) {
 	char id_num[30];
 	if(!string_ids) {
 		g_snprintf(id_num, sizeof(id_num), "%"SCNu64, id);
@@ -7121,6 +7144,9 @@ janus_streaming_mountpoint *janus_streaming_create_rtsp_source(
 	live_rtsp_source->rtsp_conn_timeout = rtsp_conn_timeout;
 	janus_mutex_init(&live_rtsp_source->keyframe.mutex);
 	live_rtsp_source->reconnect_timer = 0;
+	live_rtsp_source->connected = FALSE;
+	live_rtsp_source->rtsp_on_demand = rtsp_on_demand;
+	g_atomic_int_set(&live_rtsp_source->idle, rtsp_on_demand);
 	janus_mutex_init(&live_rtsp_source->rtsp_mutex);
 	live_rtsp->source = live_rtsp_source;
 	live_rtsp->source_destroy = (GDestroyNotify) janus_streaming_rtp_source_free;
@@ -7137,7 +7163,9 @@ janus_streaming_mountpoint *janus_streaming_create_rtsp_source(
 	live_rtsp->codecs.video_fmtp = dovideo ? (vfmtp ? g_strdup(vfmtp) : NULL) : NULL;
 	/* If we need to return an error on failure, try connecting right now */
 	if(error_on_failure) {
-		/* Now connect to the RTSP server */
+		/* Now connect to the RTSP server.
+		 * Note that if rtsp_on_demand is set, we will disconnect later
+		 * in the relay thread if there are no clients */
 		if(janus_streaming_rtsp_connect_to_server(live_rtsp) < 0) {
 			/* Error connecting, get rid of the mountpoint */
 			janus_mutex_lock(&mountpoints_mutex);
@@ -7155,6 +7183,10 @@ janus_streaming_mountpoint *janus_streaming_create_rtsp_source(
 			janus_refcount_decrease(&live_rtsp->ref);
 			return NULL;
 		}
+		/* We have successfully connected to the server,
+		 * so let's update the "last seen" timer */
+		live_rtsp_source->reconnect_timer = janus_get_monotonic_time();
+		live_rtsp_source->connected = TRUE;
 	}
 	/* If we need helper threads, spawn them now */
 	GError *error = NULL;
@@ -7225,7 +7257,7 @@ janus_streaming_mountpoint *janus_streaming_create_rtsp_source(
 		gboolean dovideo, int vcodec, char *videortpmap, char *videofmtp, gboolean bufferkf,
 		const janus_network_address *iface, int threads,
 		gint64 reconnect_delay, gint64 session_timeout, int rtsp_timeout, int rtsp_conn_timeout,
-		gboolean error_on_failure) {
+		gboolean error_on_failure, gboolean rtsp_on_demand) {
 	JANUS_LOG(LOG_ERR, "RTSP need libcurl\n");
 	return NULL;
 }
@@ -7568,7 +7600,6 @@ static void *janus_streaming_relay_thread(void *data) {
 		janus_refcount_decrease(&mountpoint->ref);
 		return NULL;
 	}
-
 	/* Add a reference to the helper threads, if needed */
 	if(mountpoint->helper_threads > 0) {
 		GList *l = mountpoint->threads;
@@ -7599,7 +7630,6 @@ static void *janus_streaming_relay_thread(void *data) {
 	/* In case this is an RTSP restreamer, we may have to send keep-alives from time to time */
 	gint64 now = janus_get_monotonic_time(), before = now, ka_timeout = 0;
 	if(source->rtsp) {
-		source->reconnect_timer = now;
 		ka_timeout = source->ka_timeout;
 	}
 #endif
@@ -7608,62 +7638,16 @@ static void *janus_streaming_relay_thread(void *data) {
 	janus_streaming_rtp_relay_packet packet;
 	while(!g_atomic_int_get(&stopping) && !g_atomic_int_get(&mountpoint->destroyed)) {
 #ifdef HAVE_LIBCURL
-		/* Let's check regularly if the RTSP server seems to be gone */
 		if(source->rtsp) {
-			if(source->reconnecting) {
-				/* We're still reconnecting, wait some more */
-				g_usleep(250000);
-				continue;
-			}
 			now = janus_get_monotonic_time();
-			if(!source->reconnecting && (now - source->reconnect_timer > source->reconnect_delay)) {
-				/*  Assume the RTSP server has gone and schedule a reconnect */
-				JANUS_LOG(LOG_WARN, "[%s] %"SCNi64"s passed with no media, trying to reconnect the RTSP stream\n",
-					name, (now - source->reconnect_timer)/G_USEC_PER_SEC);
-				audio_fd = -1;
-				video_fd[0] = -1;
-				video_fd[1] = -1;
-				video_fd[2] = -1;
-				data_fd = -1;
-				source->reconnect_timer = now;
-				source->reconnecting = TRUE;
-				/* Let's clean up the source first */
-				curl_easy_cleanup(source->curl);
-				source->curl = NULL;
-				if(source->curldata)
-					g_free(source->curldata->buffer);
-				g_free(source->curldata);
-				source->curldata = NULL;
-				if(source->audio_fd > -1) {
-					close(source->audio_fd);
+			if (!source->connected) {
+				/* We are disconnected from the RTSP server.
+				 * Let's check whether we should reconnect. */
+				if(g_atomic_int_get(&source->idle) || ((now - source->reconnect_timer) <= source->reconnect_delay)) {
+					/* We will try to reconnect later. */
+					g_usleep(250000);
+					continue;
 				}
-				source->audio_fd = -1;
-				if(source->video_fd[0] > -1) {
-					close(source->video_fd[0]);
-				}
-				source->video_fd[0] = -1;
-				if(source->video_fd[1] > -1) {
-					close(source->video_fd[1]);
-				}
-				source->video_fd[1] = -1;
-				if(source->video_fd[2] > -1) {
-					close(source->video_fd[2]);
-				}
-				source->video_fd[2] = -1;
-				if(source->data_fd > -1) {
-					close(source->data_fd);
-				}
-				source->data_fd = -1;
-				if(source->audio_rtcp_fd > -1) {
-					close(source->audio_rtcp_fd);
-				}
-				source->audio_rtcp_fd = -1;
-				if(source->video_rtcp_fd > -1) {
-					close(source->video_rtcp_fd);
-				}
-				source->video_rtcp_fd = -1;
-				if(g_atomic_int_get(&mountpoint->destroyed))
-					break;
 				/* Now let's try to reconnect */
 				if(janus_streaming_rtsp_connect_to_server(mountpoint) < 0) {
 					/* Reconnection failed? Let's try again later */
@@ -7682,18 +7666,84 @@ static void *janus_streaming_relay_thread(void *data) {
 						audio_rtcp_fd = source->audio_rtcp_fd;
 						video_rtcp_fd = source->video_rtcp_fd;
 						ka_timeout = source->ka_timeout;
+
+						source->connected = TRUE;
 					}
 				}
+				/* We need to reset the timer. In case we are connected successfully this time
+				 * is a server "last seen" time. Otherwise it's a "last reconnect attempt" time. */
 				source->reconnect_timer = janus_get_monotonic_time();
-				source->reconnecting = FALSE;
-				continue;
+				if (!source->connected) {
+					/* Reconnection failed. We'll try again later */
+					continue;
+				}
+			} else {
+				/* We are connected to the RTSP server.
+				 * Let's check regularly if the RTSP server seems to be gone
+				 * or we are switched to the idle mode (all clients are gone) */
+				gboolean disconnect = FALSE;
+				if (g_atomic_int_get(&source->idle)) {
+					JANUS_LOG(LOG_VERB, "[%s] We switched to the idle mode, disconnecting the RTSP stream\n", name);
+					disconnect = TRUE;
+					/* Send an RTSP TEARDOWN */
+					curl_easy_setopt(source->curl, CURLOPT_RTSP_REQUEST, (long)CURL_RTSPREQ_TEARDOWN);
+					if(curl_easy_perform(source->curl) != CURLE_OK) {
+						JANUS_LOG(LOG_ERR, "Couldn't send TEARDOWN request: %s\n", curl_easy_strerror(res));
+					}
+				} else if ((now - source->reconnect_timer) > source->reconnect_delay) {
+					/*  Assume the RTSP server has gone and schedule a reconnect */
+					JANUS_LOG(LOG_WARN, "[%s] %"SCNi64"s passed with no media, trying to reconnect the RTSP stream\n",
+							name, (now - source->reconnect_timer)/G_USEC_PER_SEC);
+					disconnect = TRUE;
+				}
+				if(disconnect) {
+					audio_fd = -1;
+					video_fd[0] = -1;
+					video_fd[1] = -1;
+					video_fd[2] = -1;
+					data_fd = -1;
+					/* Let's clean up the source */
+					curl_easy_cleanup(source->curl);
+					source->curl = NULL;
+					if(source->curldata)
+						g_free(source->curldata->buffer);
+					g_free(source->curldata);
+					source->curldata = NULL;
+					if(source->audio_fd > -1) {
+						close(source->audio_fd);
+					}
+					source->audio_fd = -1;
+					if(source->video_fd[0] > -1) {
+						close(source->video_fd[0]);
+					}
+					source->video_fd[0] = -1;
+					if(source->video_fd[1] > -1) {
+						close(source->video_fd[1]);
+					}
+					source->video_fd[1] = -1;
+					if(source->video_fd[2] > -1) {
+						close(source->video_fd[2]);
+					}
+					source->video_fd[2] = -1;
+					if(source->data_fd > -1) {
+						close(source->data_fd);
+					}
+					source->data_fd = -1;
+					if(source->audio_rtcp_fd > -1) {
+						close(source->audio_rtcp_fd);
+					}
+					source->audio_rtcp_fd = -1;
+					if(source->video_rtcp_fd > -1) {
+						close(source->video_rtcp_fd);
+					}
+					source->video_rtcp_fd = -1;
+					source->connected = FALSE;
+					source->reconnect_timer = now;
+					continue;
+				}
 			}
 		}
-		if(audio_fd < 0 && video_fd[0] < 0 && video_fd[1] < 0 && video_fd[2] < 0 && data_fd < 0) {
-			/* No socket, we may be in the process of reconnecting, or waiting to reconnect */
-			g_usleep(source->reconnect_delay);
-			continue;
-		}
+
 		/* We may also need to occasionally send a OPTIONS request as a keep-alive */
 		if(ka_timeout > 0) {
 			/* Let's be conservative and send a OPTIONS when half of the timeout has passed */
