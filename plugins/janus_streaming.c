@@ -2154,6 +2154,9 @@ int janus_streaming_init(janus_callbacks *callback, const char *config_path) {
 				gboolean rtsp_on_demand = FALSE;
 				if(rtspondem && rtspondem->value) {
 					rtsp_on_demand = janus_is_true(rtspondem->value);
+					if (rtsp_on_demand) {
+						JANUS_LOG(LOG_VERB, "RTSP-on-demand is enabled for mountpoint '%s'\n", cat->name);
+					}
 				}
 
 				if((doaudio || dovideo) && iface && iface->value) {
@@ -7687,8 +7690,9 @@ static void *janus_streaming_relay_thread(void *data) {
 					disconnect = TRUE;
 					/* Send an RTSP TEARDOWN */
 					curl_easy_setopt(source->curl, CURLOPT_RTSP_REQUEST, (long)CURL_RTSPREQ_TEARDOWN);
-					if(curl_easy_perform(source->curl) != CURLE_OK) {
-						JANUS_LOG(LOG_ERR, "Couldn't send TEARDOWN request: %s\n", curl_easy_strerror(res));
+					int retval = curl_easy_perform(source->curl);
+					if(retval != CURLE_OK) {
+						JANUS_LOG(LOG_ERR, "Couldn't send TEARDOWN request: %s\n", curl_easy_strerror(retval));
 					}
 				} else if ((now - source->reconnect_timer) > source->reconnect_delay) {
 					/*  Assume the RTSP server has gone and schedule a reconnect */
