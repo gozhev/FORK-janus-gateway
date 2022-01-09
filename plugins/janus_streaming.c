@@ -7639,6 +7639,12 @@ static void *janus_streaming_relay_thread(void *data) {
 	/* Loop */
 	int num = 0;
 	janus_streaming_rtp_relay_packet packet;
+
+	janus_streaming_rtp_relay_packet packet_saved;
+	int saved = 0;
+	char buffer_saved[1500];
+	memset(buffer_saved, 0, 1500);
+
 	while(!g_atomic_int_get(&stopping) && !g_atomic_int_get(&mountpoint->destroyed)) {
 #ifdef HAVE_LIBCURL
 		if(source->rtsp) {
@@ -7743,6 +7749,7 @@ static void *janus_streaming_relay_thread(void *data) {
 					source->video_rtcp_fd = -1;
 					source->connected = FALSE;
 					source->reconnect_timer = now;
+					saved = 0;
 					continue;
 				}
 			}
@@ -8052,6 +8059,9 @@ static void *janus_streaming_relay_thread(void *data) {
 							/* We received the last part of the keyframe, get rid of the old one and use this from now on */
 							JANUS_LOG(LOG_HUGE, "[%s] ... ... last part of keyframe received! ts=%"SCNu32", %d packets\n",
 								name, source->keyframe.temp_ts, g_list_length(source->keyframe.temp_keyframe));
+
+							packet_saved.data->markerbit = 1;
+
 							source->keyframe.temp_ts = 0;
 							janus_mutex_lock(&source->keyframe.mutex);
 							if(source->keyframe.latest_keyframe != NULL)
@@ -8181,6 +8191,7 @@ static void *janus_streaming_relay_thread(void *data) {
 						packet.ptype = packet.data->type;
 						packet.timestamp = ntohl(packet.data->timestamp);
 						packet.seq_number = ntohs(packet.data->seq_number);
+
 						/* Take note of the simulcast SSRCs */
 						if(source->simulcast) {
 							packet.ssrc[0] = v_last_ssrc[0];
@@ -8188,11 +8199,17 @@ static void *janus_streaming_relay_thread(void *data) {
 							packet.ssrc[2] = v_last_ssrc[2];
 						}
 						/* Go! */
-						janus_mutex_lock(&mountpoint->mutex);
-						g_list_foreach(mountpoint->helper_threads == 0 ? mountpoint->viewers : mountpoint->threads,
-							mountpoint->helper_threads == 0 ? janus_streaming_relay_rtp_packet : janus_streaming_helper_rtprtcp_packet,
-							&packet);
-						janus_mutex_unlock(&mountpoint->mutex);
+						if (saved) {
+							janus_mutex_lock(&mountpoint->mutex);
+							g_list_foreach(mountpoint->helper_threads == 0 ? mountpoint->viewers : mountpoint->threads,
+								mountpoint->helper_threads == 0 ? janus_streaming_relay_rtp_packet : janus_streaming_helper_rtprtcp_packet, &packet_saved);
+							janus_mutex_unlock(&mountpoint->mutex);
+						}
+
+						packet_saved = packet;
+						packet_saved.data = (janus_rtp_header*)buffer_saved;
+						memcpy(buffer_saved, buffer, bytes);
+						saved = 1;
 					}
 					continue;
 				} else if(data_fd != -1 && fds[i].fd == data_fd) {
